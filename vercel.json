@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "bun install",
+  "buildCommand": "cd packages/web && bunx vite build",
+  "outputDirectory": "packages/web/dist",
+  "rewrites": [{ "source": "/((?!api/|game/|assets/).*)", "destination": "/index.html" }],
+  "headers": [
+    {
+      "source": "/game/(.*)",
+      "headers": [{ "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }]
+    }
+  ]
+}
