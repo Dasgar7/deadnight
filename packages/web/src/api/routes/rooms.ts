@@ -1,94 +1,111 @@
 import { ORPCError } from "@orpc/server";
+import { createClient, type InStatement } from "@libsql/client/web";
 import { z } from "zod";
 import { base } from "../__core/app";
 
 /**
  * Co-op rooms. Host-authoritative: the host's browser runs the zombie sim and posts snapshots; guests post their own
- * state + hit events. Everything is polled over oRPC (the dev server has no WebSocket upgrade), state lives in memory.
+ * state + hit events. Everything is polled over oRPC (no WebSocket upgrade on serverless). State lives in the libSQL
+ * database (DATABASE_URL) so every serverless instance sees the same rooms.
  */
 
-interface PlayerState {
-  id: string;
-  name: string;
-  me: Record<string, unknown>;
-  lastSeen: number;
-  joined: number;
-  color: number;
-  events: unknown[];
-}
-interface Room {
-  code: string;
-  hostId: string;
-  players: Map<string, PlayerState>;
-  zs: unknown[];
-  world: Record<string, unknown> | null;
-  hostQueue: unknown[]; // hit events from guests, drained by the host
-  seq: number;
-  created: number;
-  over: boolean;
-}
-
-const g = globalThis as unknown as { __dnRooms?: Map<string, Room> };
-const rooms = (g.__dnRooms ??= new Map<string, Room>());
+const env = (globalThis as unknown as { process: { env: Record<string, string | undefined> } }).process.env;
+const db = createClient({ url: env.DATABASE_URL!, authToken: env.DATABASE_AUTH_TOKEN });
 
 const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const TIMEOUT = 9000;
 const MAX_PLAYERS = 4;
+const HITS = "#hits";
 
-function makeCode() {
-  for (let n = 0; n < 50; n++) {
-    let c = "";
-    for (let i = 0; i < 4; i++) c += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
-    if (!rooms.has(c)) return c;
-  }
-  return Math.random().toString(36).slice(2, 7).toUpperCase();
+let ready: Promise<unknown> | null = null;
+function init() {
+  return (ready ??= db
+    .batch(
+      [
+        "CREATE TABLE IF NOT EXISTS dn_rooms (code TEXT PRIMARY KEY, host_id TEXT NOT NULL, zs TEXT NOT NULL DEFAULT '[]', world TEXT, seq INTEGER NOT NULL DEFAULT 0, over INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS dn_players (room TEXT NOT NULL, id TEXT NOT NULL, name TEXT NOT NULL, color INTEGER NOT NULL, me TEXT NOT NULL DEFAULT '{}', last_seen INTEGER NOT NULL, joined INTEGER NOT NULL, PRIMARY KEY (room, id))",
+        "CREATE TABLE IF NOT EXISTS dn_events (n INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT NOT NULL, target TEXT NOT NULL, body TEXT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS dn_events_rt ON dn_events (room, target)",
+      ],
+      "write",
+    )
+    .catch((e) => {
+      ready = null;
+      throw e;
+    }));
 }
+
 const uid = () => Math.random().toString(36).slice(2, 10);
 const cleanName = (s: string) => s.replace(/[^\w \-.]/g, "").trim().slice(0, 14) || "Survivor";
-
-function sweep() {
-  const now = Date.now();
-  for (const [code, r] of rooms) {
-    for (const [id, p] of r.players) if (now - p.lastSeen > TIMEOUT) r.players.delete(id);
-    const host = r.players.get(r.hostId);
-    if (!host || r.players.size === 0) {
-      // host gone: keep the room visible for a moment so guests can see "closed", then drop
-      if (now - r.created > 60000 || r.players.size === 0) rooms.delete(code);
-    }
+const parse = (s: unknown): unknown => {
+  try {
+    return JSON.parse(String(s));
+  } catch {
+    return null;
   }
+};
+
+/** Drop timed-out players, rooms whose host is gone, and their queued events. */
+function sweepStmts(now: number): InStatement[] {
+  return [
+    { sql: "DELETE FROM dn_players WHERE last_seen < ?", args: [now - TIMEOUT] },
+    { sql: "DELETE FROM dn_rooms WHERE NOT EXISTS (SELECT 1 FROM dn_players p WHERE p.room = dn_rooms.code AND p.id = dn_rooms.host_id)", args: [] },
+    { sql: "DELETE FROM dn_players WHERE NOT EXISTS (SELECT 1 FROM dn_rooms r WHERE r.code = dn_players.room)", args: [] },
+    { sql: "DELETE FROM dn_events WHERE NOT EXISTS (SELECT 1 FROM dn_rooms r WHERE r.code = dn_events.room)", args: [] },
+  ];
 }
 
-function playersOut(r: Room) {
-  return [...r.players.values()].map((p) => ({ id: p.id, name: p.name, color: p.color, me: p.me }));
-}
+const IS_HOST = "EXISTS (SELECT 1 FROM dn_rooms WHERE code = ? AND host_id = ?)";
 
 export const roomsApi = {
-  create: base.input(z.object({ name: z.string().max(40) })).handler(({ input }) => {
-    sweep();
-    const code = makeCode();
-    const id = uid();
+  create: base.input(z.object({ name: z.string().max(40) })).handler(async ({ input }) => {
+    await init();
     const now = Date.now();
-    const r: Room = { code, hostId: id, players: new Map(), zs: [], world: null, hostQueue: [], seq: 0, created: now, over: false };
-    r.players.set(id, { id, name: cleanName(input.name), me: {}, lastSeen: now, joined: now, color: 0, events: [] });
-    rooms.set(code, r);
+    await db.batch(sweepStmts(now), "write");
+    let code = "";
+    for (let n = 0; n < 50 && !code; n++) {
+      let c = "";
+      for (let i = 0; i < 4; i++) c += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
+      const r = await db.execute({ sql: "SELECT 1 FROM dn_rooms WHERE code = ?", args: [c] });
+      if (!r.rows.length) code = c;
+    }
+    if (!code) code = Math.random().toString(36).slice(2, 7).toUpperCase();
+    const id = uid();
+    await db.batch(
+      [
+        { sql: "INSERT INTO dn_rooms (code, host_id, created) VALUES (?, ?, ?)", args: [code, id, now] },
+        { sql: "INSERT INTO dn_players (room, id, name, color, last_seen, joined) VALUES (?, ?, ?, 0, ?, ?)", args: [code, id, cleanName(input.name), now, now] },
+      ],
+      "write",
+    );
     return { code, id, hostId: id };
   }),
 
-  join: base.input(z.object({ code: z.string().max(10), name: z.string().max(40) })).handler(({ input }) => {
-    sweep();
-    const r = rooms.get(input.code.trim().toUpperCase());
-    if (!r || !r.players.has(r.hostId)) throw new ORPCError("NOT_FOUND", { message: "No room with that code" });
-    if (r.players.size >= MAX_PLAYERS) throw new ORPCError("BAD_REQUEST", { message: "Room is full (4 players)" });
-    const id = uid();
+  join: base.input(z.object({ code: z.string().max(10), name: z.string().max(40) })).handler(async ({ input }) => {
+    await init();
     const now = Date.now();
-    const used = new Set([...r.players.values()].map((p) => p.color));
+    const code = input.code.trim().toUpperCase();
+    await db.batch(sweepStmts(now), "write");
+    const [room, players] = await db.batch(
+      [
+        { sql: "SELECT host_id FROM dn_rooms WHERE code = ?", args: [code] },
+        { sql: "SELECT name, color FROM dn_players WHERE room = ?", args: [code] },
+      ],
+      "read",
+    );
+    if (!room!.rows.length) throw new ORPCError("NOT_FOUND", { message: "No room with that code" });
+    if (players!.rows.length >= MAX_PLAYERS) throw new ORPCError("BAD_REQUEST", { message: "Room is full (4 players)" });
+    const used = new Set(players!.rows.map((r) => Number(r.color)));
     let color = 0;
     while (used.has(color)) color++;
     let name = cleanName(input.name);
-    const names = new Set([...r.players.values()].map((p) => p.name));
-    if (names.has(name)) name = `${name.slice(0, 11)}-${color + 1}`;
-    r.players.set(id, { id, name, me: {}, lastSeen: now, joined: now, color, events: [] });
-    return { code: r.code, id, hostId: r.hostId, name };
+    if (players!.rows.some((r) => r.name === name)) name = `${name.slice(0, 11)}-${color + 1}`;
+    const id = uid();
+    await db.execute({
+      sql: "INSERT INTO dn_players (room, id, name, color, last_seen, joined) VALUES (?, ?, ?, ?, ?, ?)",
+      args: [code, id, name, color, now, now],
+    });
+    return { code, id, hostId: String(room!.rows[0]!.host_id), name };
   }),
 
   sync: base
@@ -104,59 +121,77 @@ export const roomsApi = {
         over: z.boolean().optional(),
       }),
     )
-    .handler(({ input }) => {
-      const r = rooms.get(input.code);
-      const p = r?.players.get(input.id);
-      if (!r || !p) return { closed: true as const };
+    .handler(async ({ input }) => {
+      await init();
       const now = Date.now();
-      p.lastSeen = now;
-      if (input.me) p.me = input.me as Record<string, unknown>;
-      const isHost = input.id === r.hostId;
-      if (isHost) {
-        if (input.zs) r.zs = input.zs;
-        if (input.world) r.world = input.world as Record<string, unknown>;
-        if (input.over) r.over = true;
-        r.seq++;
-        for (const e of input.ev ?? []) {
-          const ev = e as { to?: string };
-          if (ev.to) r.players.get(ev.to)?.events.push(e);
-          else for (const q of r.players.values()) if (q.id !== r.hostId) q.events.push(e);
-        }
-      } else {
-        if (input.hits?.length) {
-          for (const h of input.hits) r.hostQueue.push({ ...(h as object), by: input.id });
-          if (r.hostQueue.length > 600) r.hostQueue.splice(0, r.hostQueue.length - 600);
-        }
-        for (const e of input.ev ?? []) (r.players.get(r.hostId)?.events ?? []).push({ ...(e as object), by: input.id });
+      const { code, id } = input;
+      const s: InStatement[] = [];
+      // 0: heartbeat (+ own state) — also tells us whether this player still exists
+      s.push({ sql: "UPDATE dn_players SET last_seen = ?, me = COALESCE(?, me) WHERE room = ? AND id = ?", args: [now, input.me ? JSON.stringify(input.me) : null, code, id] });
+      // 1: host-only world write, guarded by host_id
+      s.push({
+        sql: "UPDATE dn_rooms SET zs = COALESCE(?, zs), world = COALESCE(?, world), over = over | ?, seq = seq + 1 WHERE code = ? AND host_id = ?",
+        args: [input.zs ? JSON.stringify(input.zs) : null, input.world ? JSON.stringify(input.world) : null, input.over ? 1 : 0, code, id],
+      });
+      for (const e of input.ev ?? []) {
+        const body = JSON.stringify(e);
+        const to = (e as { to?: string }).to;
+        // host → one player, or everyone else
+        if (to) s.push({ sql: `INSERT INTO dn_events (room, target, body) SELECT ?, id, ? FROM dn_players WHERE room = ? AND id = ? AND ${IS_HOST}`, args: [code, body, code, to, code, id] });
+        else s.push({ sql: `INSERT INTO dn_events (room, target, body) SELECT ?, id, ? FROM dn_players WHERE room = ? AND id <> ? AND ${IS_HOST}`, args: [code, body, code, id, code, id] });
+        // guest → host
+        s.push({ sql: "INSERT INTO dn_events (room, target, body) SELECT ?, host_id, ? FROM dn_rooms WHERE code = ? AND host_id <> ?", args: [code, JSON.stringify({ ...(e as object), by: id }), code, id] });
       }
-      sweep();
-      if (!r.players.has(r.hostId)) return { closed: true as const };
-      const events = p.events.splice(0, p.events.length);
+      for (const h of input.hits ?? []) {
+        s.push({ sql: "INSERT INTO dn_events (room, target, body) SELECT ?, ?, ? FROM dn_rooms WHERE code = ? AND host_id <> ?", args: [code, HITS, JSON.stringify({ ...(h as object), by: id }), code, id] });
+      }
+      s.push(...sweepStmts(now));
+      const iPlayers = s.length;
+      s.push({ sql: "SELECT id, name, color, me FROM dn_players WHERE room = ? ORDER BY joined", args: [code] });
+      const iRoom = s.length;
+      s.push({ sql: "SELECT host_id, seq, over, zs, world FROM dn_rooms WHERE code = ?", args: [code] });
+      const iEv = s.length;
+      s.push({ sql: "DELETE FROM dn_events WHERE room = ? AND target = ? RETURNING body", args: [code, id] });
+      s.push({ sql: `DELETE FROM dn_events WHERE room = ? AND target = ? AND ${IS_HOST} RETURNING body`, args: [code, HITS, code, id] });
+
+      const res = await db.batch(s, "write");
+      const players = res[iPlayers]!.rows;
+      const room = res[iRoom]!.rows[0];
+      if (!room || !players.some((p) => p.id === id)) return { closed: true as const };
+      const hostId = String(room.host_id);
+      const isHost = id === hostId;
+      const events = res[iEv]!.rows.map((r) => parse(r.body));
       const out: {
         closed: false;
         hostId: string;
         seq: number;
         t: number;
         over: boolean;
-        players: ReturnType<typeof playersOut>;
+        players: { id: string; name: string; color: number; me: unknown }[];
         events: unknown[];
-        zs?: unknown[];
-        world?: Record<string, unknown> | null;
+        zs?: unknown;
+        world?: unknown;
         hits?: unknown[];
-      } = { closed: false, hostId: r.hostId, seq: r.seq, t: now, over: r.over, players: playersOut(r).filter((q) => q.id !== input.id), events };
-      if (isHost) out.hits = r.hostQueue.splice(0, r.hostQueue.length);
+      } = {
+        closed: false,
+        hostId,
+        seq: Number(room.seq),
+        t: now,
+        over: Number(room.over) > 0,
+        players: players.filter((p) => p.id !== id).map((p) => ({ id: String(p.id), name: String(p.name), color: Number(p.color), me: parse(p.me) ?? {} })),
+        events,
+      };
+      if (isHost) out.hits = res[iEv + 1]!.rows.map((r) => parse(r.body));
       else {
-        out.zs = r.zs;
-        out.world = r.world;
+        out.zs = parse(room.zs) ?? [];
+        out.world = room.world ? parse(room.world) : null;
       }
       return out;
     }),
 
-  leave: base.input(z.object({ code: z.string().max(10), id: z.string().max(20) })).handler(({ input }) => {
-    const r = rooms.get(input.code);
-    if (!r) return { ok: true };
-    r.players.delete(input.id);
-    if (input.id === r.hostId || r.players.size === 0) rooms.delete(input.code);
+  leave: base.input(z.object({ code: z.string().max(10), id: z.string().max(20) })).handler(async ({ input }) => {
+    await init();
+    await db.batch([{ sql: "DELETE FROM dn_players WHERE room = ? AND id = ?", args: [input.code, input.id] }, ...sweepStmts(Date.now())], "write");
     return { ok: true };
   }),
 };
