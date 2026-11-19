@@ -2,7 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
   "installCommand": "bun install",
-  "buildCommand": "cd packages/web && bunx vite build",
+  "buildCommand": "cd packages/web && VITE_HIDE_BADGE=1 bunx vite build",
   "outputDirectory": "packages/web/dist",
   "rewrites": [
     {
